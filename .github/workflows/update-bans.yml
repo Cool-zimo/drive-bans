@@ -1,0 +1,103 @@
+name: Update ban records
+
+# 每小时整点跑一次：重算每条封禁的剩余时长，到期即除名并登记待清理。
+# 注意：GitHub Actions 的 schedule 不保证准点，繁忙时常延迟几分钟到几十分钟，
+# 所以剩余时长一律以 expireAt 绝对时间戳为准，不依赖本任务跑得准不准。
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Recompute remaining time and expire
+        run: |
+          python3 - <<'PY'
+          import json, os, time, datetime
+
+          BANS='bans.json'; CLEAN='cleanup.json'
+          bans=json.load(open(BANS)) if os.path.exists(BANS) else {'bans':[]}
+          clean=json.load(open(CLEAN)) if os.path.exists(CLEAN) else {'pending':[]}
+          if not isinstance(clean.get('pending'),list): clean['pending']=[]
+
+          now=int(time.time()*1000)
+          keep=[]; expired=[]
+          for b in bans.get('bans',[]):
+              seen=int(b.get('seenAt') or 0)
+              days=float(b.get('days') or 3)
+              # 没上报 seenAt 之前不计时：等客户端 PR 上报，避免"没看到就刑满"
+              if not seen:
+                  b['expireAt']=0
+                  b['remaining']=int(days*86400000)
+                  keep.append(b); continue
+              end=int(b.get('expireAt') or 0) or int(seen+days*86400000)
+              b['expireAt']=end
+              b['remaining']=max(0,end-now)
+              if now>=end:
+                  expired.append(b.get('user'))
+              else:
+                  keep.append(b)
+
+          for u in expired:
+              if u and u not in clean['pending']:
+                  clean['pending'].append(u)
+
+          bans['bans']=keep
+          bans['updatedAt']=datetime.datetime.utcnow().isoformat()+'Z'
+          json.dump(bans,open(BANS,'w'),ensure_ascii=False,indent=2)
+          json.dump(clean,open(CLEAN,'w'),ensure_ascii=False,indent=2)
+          print('kept',len(keep),'expired',expired)
+          PY
+
+      - name: Auto-merge state PRs (report seenAt from clients)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr list --state open --json number,headRefName,title --jq '.[] | select(.headRefName|startswith("state-")) | .number' > /tmp/prs.txt || true
+          while read n; do
+            [ -z "$n" ] && continue
+            gh pr merge "$n" --merge --admin || echo "skip $n"
+          done < /tmp/prs.txt
+
+      - name: Merge seenAt into bans.json
+        run: |
+          python3 - <<'PY'
+          import json, os, glob
+          BANS='bans.json'
+          bans=json.load(open(BANS)) if os.path.exists(BANS) else {'bans':[]}
+          idx={str(b.get('user','')).lower():b for b in bans.get('bans',[])}
+          n=0
+          for f in glob.glob('state/*.json'):
+              try: st=json.load(open(f))
+              except Exception: continue
+              u=str(st.get('user') or '').lower()
+              seen=int(st.get('seenAt') or 0)
+              if u in idx and seen and not int(idx[u].get('seenAt') or 0):
+                  idx[u]['seenAt']=seen
+                  days=float(idx[u].get('days') or 3)
+                  idx[u]['expireAt']=int(seen+days*86400000)
+                  n+=1
+          json.dump(bans,open(BANS,'w'),ensure_ascii=False,indent=2)
+          print('merged seenAt:',n)
+          PY
+
+      - name: Commit
+        run: |
+          git config user.name "ban-bot"
+          git config user.email "ban-bot@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then echo "no change"; else
+            git commit -m "chore: update ban records"
+            git push
+          fi
